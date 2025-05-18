@@ -3,21 +3,14 @@ use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::thread;
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
 use tokio::time::sleep;
 
-#[derive(Deserialize, Serialize)]
-struct Streamer {
-    profile_url: String,
-    profile_name: String,
-    profile_status: StreamerState,
-    download_size_mb: u32,
-}
+pub mod downloader;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-enum StreamerState {
+pub enum StreamerState {
     #[serde(rename = "added")]
     Added,
     #[serde(rename = "waiting")]
@@ -30,32 +23,28 @@ enum StreamerState {
     Error(u32),
 }
 
-enum StreamerAction {
-    Start,
-    Stop,
-}
-
-struct StreamerUpdate {
-    pub streamer: Streamer,
-    pub action: StreamerAction,
-}
-
 enum OnlineState {
     Online(String),
     Offline,
 }
 
-fn download_manager(rx_channel: Arc<Receiver<StreamerUpdate>>, tx_channel: Arc<Sender<StreamerUpdate>>) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting Downloader Thread");
-    loop {
-        // Check Status of all currently managed processes
-        // Check for any messages
-        for msg in rx_channel.try_iter() {
-            println!("Handling Message ... {} is being started", msg.streamer.profile_name);
+#[derive(Deserialize, Serialize)]
+pub struct Streamer {
+    profile_url: String,
+    profile_name: String,
+    profile_status: StreamerState,
+    download_size_mb: u32,
+}
+
+impl Default for Streamer {
+    fn default() -> Self {
+        Streamer {
+            profile_url: "N/A".to_string(),
+            profile_name: "N/A".to_string(),
+            profile_status: StreamerState::Stopped,
+            download_size_mb: 0,
         }
-        thread::sleep(Duration::from_secs(1));
     }
-    Ok(())
 }
 
 async fn obtain_user_status(
@@ -94,7 +83,30 @@ async fn obtain_user_status(
 
 // Main status loop
 // 1. Query all waiting users
-async fn status_loop() -> Result<(), Box<dyn std::error::Error>> {
+async fn status_loop(
+    rx_channel: Arc<Receiver<downloader::StreamerUpdate>>,
+    tx_channel: Arc<Sender<downloader::StreamerUpdate>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rx = Arc::clone(&rx_channel);
+    println!("DEBUG. Waiting for heartbeat");
+    let hb_task = tokio::task::spawn_blocking(move || {
+        let hb = rx.recv().unwrap();
+        let mut hb_received: bool = false;
+        match hb.action {
+            downloader::StreamerAction::Heartbeat => {
+                println!("Heartbeat Received! Starting");
+                hb_received = true;
+            }
+            _ => {
+                println!("Error! Not heartbeat received!");
+            }
+        }
+        return hb_received;
+    });
+    if !hb_task.await? {
+        return Err(Box::new(downloader::HeartbeatError::new()));
+    }
+
     let streamer_api_client = Client::new();
     let streamer_statuser_client = Client::new();
     let room_regex: Regex = Regex::new(r#"window\.initialRoomDossier\s*=\s*("(?:\\.|[^\\"])*")"#)?;
@@ -129,6 +141,10 @@ async fn status_loop() -> Result<(), Box<dyn std::error::Error>> {
                         .send()
                         .await
                         .unwrap();
+                    tx_channel.send(downloader::StreamerUpdate {
+                        streamer: new_user_status,
+                        action: downloader::StreamerAction::Start(m3u8.clone()),
+                    })?;
                 }
                 OnlineState::Offline => println!("Offline"),
             }
@@ -142,14 +158,16 @@ async fn status_loop() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (statuser_tx, downloader_rx) = unbounded::<StreamerUpdate>();
-    let (downloader_tx, statuser_rx) = unbounded::<StreamerUpdate>();
+    let (statuser_tx, downloader_rx) = unbounded::<downloader::StreamerUpdate>();
+    let (downloader_tx, statuser_rx) = unbounded::<downloader::StreamerUpdate>();
     let dl_tx_ptr = Arc::new(downloader_tx);
     let dl_rx_ptr = Arc::new(downloader_rx);
     let downloader_thread_handle = thread::spawn(move || {
-        let res = download_manager(dl_rx_ptr, dl_tx_ptr);
+        let res = downloader::download_manager(dl_rx_ptr, dl_tx_ptr);
     });
-    return status_loop().await;
+    let status_tx_ptr = Arc::new(statuser_tx);
+    let status_rx_ptr = Arc::new(statuser_rx);
+    return status_loop(status_rx_ptr, status_tx_ptr).await;
 }
 #[cfg(test)]
 #[test]
