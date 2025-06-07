@@ -11,3 +11,4 @@ regex = "1.11.1"
 serde = { version = "1.0.219", features = ["derive"] }
 crossbeam = "0.8.4"
 jiff = "0.2.13"
+nix = { version = "0.30.1", features = ["signal"] }

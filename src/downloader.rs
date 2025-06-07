@@ -1,7 +1,10 @@
 use crate::Streamer;
 use crossbeam::channel::{Receiver, Sender};
 use jiff::{Timestamp, tz::TimeZone};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use std::fmt;
+use std::fs::File;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::Arc;
@@ -71,10 +74,12 @@ pub struct DownloaderProc {
 
 impl DownloaderProc {
     fn new(url: &str, name: &str) -> DownloaderProc {
+        // fixme: this needs to be configurable
         let out_path = String::from("/tmp");
         let filename = format!(
-            "{}/{}",
+            "{}/{}-{}.mp4",
             out_path,
+            name,
             Timestamp::now()
                 .to_zoned(TimeZone::system())
                 .strftime("%H_%M_%S-%m_%d_%Y")
@@ -96,27 +101,45 @@ impl DownloaderProc {
     }
 
     fn start_downloading(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let stdout_file = File::create(format!("/tmp/{}-stdout.log", self.name))?;
+        let stderr_file = File::create(format!("/tmp/{}-stderr.log", self.name))?;
         let proc = Command::new("ffmpeg")
             .arg("-i")
             .arg(&self.m3u8_url)
             .arg("-c")
             .arg("copy")
             .arg(self.download_file.as_path())
+            .stdout(stdout_file)
+            .stderr(stderr_file)
             .spawn()?;
         self.handle = Some(proc);
         Ok(())
     }
 
     fn stop_downloading(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("Stopping Downloader for {}", self.name);
         if let Some(proc) = self.handle.as_mut() {
-            match proc.kill() {
-                Ok(()) => {
-                    return Ok(());
+            let pid = Pid::from_raw(proc.id() as i32);
+            kill(pid, Signal::SIGINT)?;
+            // After killing, sleep for 250 ms, check on the status, if it's not stopped kill it
+            thread::sleep(Duration::from_millis(250));
+            if proc.try_wait().unwrap().is_none() {
+                match proc.kill() {
+                    Ok(()) => {
+                        println!(
+                            "WARN: SIGTERM didn't stop process so used SIGKILL for: {}",
+                            self.name
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        println!("ERROR: couldn't stop process");
+                        return Err(e.into());
+                    }
                 }
-                Err(e) => {
-                    println!("COULDN'T STOP PROCESS");
-                    return Err(e.into());
-                }
+            } else {
+                println!("DEBUG: Stopped downloader for: {}", self.name);
+                return Ok(());
             }
         } else {
             return Err(Box::new(DownloaderError::new(
@@ -139,6 +162,7 @@ pub fn download_manager(
         action: StreamerAction::Heartbeat,
     })?;
     while isrunning {
+        println!("Debug: {} Streams Running", downloaders.len());
         // Check Status of all currently managed processes
         // Check for any messages
         let mut to_remove = Vec::new();
@@ -157,6 +181,7 @@ pub fn download_manager(
             match msg.action {
                 StreamerAction::Start(m3u8) => {
                     let mut new_downloader = DownloaderProc::new(&m3u8, &msg.streamer.profile_name);
+                    println!("Starting {}", new_downloader.name);
                     new_downloader.start_downloading()?;
                     downloaders.push(new_downloader);
                 }
@@ -169,6 +194,9 @@ pub fn download_manager(
                         .stop_downloading()?;
                 }
                 StreamerAction::StopAll => {
+                    // When this happens it seems borderline random whether or not there's any "known about" running streams. I have no idea what's happening to the downloaders vector. But the processes in them are successfully exiting.
+                    // Actually what's probably happening is the child process is somehow consuming the control-c, stopping, then getting automatically removed from the vector. Don't know how that's happening
+                    println!("DEBUG. Stop {} Stream(s) and Exit.", downloaders.len());
                     isrunning = false;
                     downloaders
                         .iter_mut()
@@ -182,7 +210,9 @@ pub fn download_manager(
                 }
             }
         }
-        thread::sleep(Duration::from_secs(1));
+        if isrunning {
+            thread::sleep(Duration::from_secs(1));
+        }
     }
     Ok(())
 }

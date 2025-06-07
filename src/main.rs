@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use std::thread;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::sleep;
 
 pub mod downloader;
@@ -82,7 +83,9 @@ async fn obtain_user_status(
 }
 
 // Main status loop
-// 1. Query all waiting users
+// 1. Query for any users manually stopped and kill their downloads
+// 2. Query all waiting users, check if any of them came online
+// 3. If any of the waiting users are online start a downloader thread and update their state in the DB
 async fn status_loop(
     rx_channel: Arc<Receiver<downloader::StreamerUpdate>>,
     tx_channel: Arc<Sender<downloader::StreamerUpdate>>,
@@ -94,7 +97,7 @@ async fn status_loop(
         let mut hb_received: bool = false;
         match hb.action {
             downloader::StreamerAction::Heartbeat => {
-                println!("Heartbeat Received! Starting");
+                println!("TRACE. Heartbeat Received! Starting");
                 hb_received = true;
             }
             _ => {
@@ -106,11 +109,29 @@ async fn status_loop(
     if !hb_task.await? {
         return Err(Box::new(downloader::HeartbeatError::new()));
     }
+    println!("DEBUG. Heartbeat Received! Starting");
 
     let streamer_api_client = Client::new();
     let streamer_statuser_client = Client::new();
     let room_regex: Regex = Regex::new(r#"window\.initialRoomDossier\s*=\s*("(?:\\.|[^\\"])*")"#)?;
     loop {
+        // TODO: Need to detect when a user has been manually stopped correctly, I think empty requests are failing
+        println!("DEBUG. Get Stopped Users ...");
+        let stopped_users_resp = streamer_api_client
+            .get("http://127.0.0.1:8000/users/state/stopped")
+            .send()
+            .await
+            .unwrap();
+        // Handle this, don't just unwrap
+        let stopped_users: Vec<Streamer> =
+            stopped_users_resp.json::<Vec<Streamer>>().await.unwrap();
+        for user in stopped_users {
+            tx_channel.send(downloader::StreamerUpdate {
+                streamer: user,
+                action: downloader::StreamerAction::Stop,
+            })?;
+        }
+        println!("DEBUG. Get Waiting Users ...");
         let waiting_users_resp = streamer_api_client
             .get("http://127.0.0.1:8000/users/state/waiting")
             .send()
@@ -120,7 +141,7 @@ async fn status_loop(
         let waiting_users: Vec<Streamer> =
             waiting_users_resp.json::<Vec<Streamer>>().await.unwrap();
         for user in waiting_users {
-            println!("{}", user.profile_name);
+            println!("DEBUG: Statusing: {}", user.profile_name);
             // Handle This Error then handle whether or not they're online
             let state: OnlineState =
                 obtain_user_status(&user, &streamer_statuser_client, &room_regex)
@@ -141,6 +162,7 @@ async fn status_loop(
                         .send()
                         .await
                         .unwrap();
+                    println!("Send Message to Downloader Thread");
                     tx_channel.send(downloader::StreamerUpdate {
                         streamer: new_user_status,
                         action: downloader::StreamerAction::Start(m3u8.clone()),
@@ -148,12 +170,10 @@ async fn status_loop(
                 }
                 OnlineState::Offline => println!("Offline"),
             }
-            sleep(tokio::time::Duration::from_secs(10)).await;
+            sleep(tokio::time::Duration::from_secs(5)).await;
         }
         sleep(tokio::time::Duration::from_secs(5)).await;
-        break;
     }
-    Ok(())
 }
 
 #[tokio::main]
@@ -163,11 +183,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dl_tx_ptr = Arc::new(downloader_tx);
     let dl_rx_ptr = Arc::new(downloader_rx);
     let downloader_thread_handle = thread::spawn(move || {
-        let res = downloader::download_manager(dl_rx_ptr, dl_tx_ptr);
+        let _res = downloader::download_manager(dl_rx_ptr, dl_tx_ptr);
     });
     let status_tx_ptr = Arc::new(statuser_tx);
     let status_rx_ptr = Arc::new(statuser_rx);
-    return status_loop(status_rx_ptr, status_tx_ptr).await;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    tokio::select! {
+        ret = status_loop(status_rx_ptr, status_tx_ptr.clone()) => {
+            if let Err(e) = ret {
+                println!("ERROR: Status Loop Crashed! {}", e);
+                return Err(e);
+            }
+        }
+        _ = async {
+            tokio::select! {
+                _ = sigint.recv() => println!("Received SIGINT"),
+                _ = sigterm.recv() => println!("Received SIGTERM"),
+            }
+        } => {
+            println!("Entering Shutdown State");
+            status_tx_ptr.send(downloader::StreamerUpdate{
+                streamer: Streamer {
+                        profile_url: "N/A".to_string(),
+                        profile_name: "N/A".to_string(),
+                        profile_status: StreamerState::Stopped,
+                        download_size_mb: 0 },
+                action: downloader::StreamerAction::StopAll
+            })?;
+        }
+    }
+    let _thread_res = downloader_thread_handle.join();
+    Ok(())
 }
 #[cfg(test)]
 #[test]
