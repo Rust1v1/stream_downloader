@@ -1,6 +1,10 @@
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use env_logger::Builder;
-use log::{debug, error, info, trace};
+use figment::{
+    Figment,
+    providers::{Env, Format, Serialized, Toml},
+};
+use log::{debug, error, info, trace, warn};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -11,6 +15,25 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::sleep;
 
 pub mod downloader;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DownloaderConfig {
+    backend_url: String,
+    enable_downloader: bool,
+    main_loop_sleep_time: u64,
+    sleep_time_between_statusing: u64,
+}
+
+impl Default for DownloaderConfig {
+    fn default() -> DownloaderConfig {
+        DownloaderConfig {
+            backend_url: String::from("http://127.0.0.1:8000"),
+            enable_downloader: true,
+            main_loop_sleep_time: 5,
+            sleep_time_between_statusing: 5,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum StreamerState {
@@ -70,10 +93,10 @@ async fn obtain_user_status(
         .expect("No Valid Regex Found")
         .as_str();
     let json_obj: Value =
-        serde_json::from_str(&dossier_json_str).expect("Invalid JSON Object Received");
+        serde_json::from_str(dossier_json_str).expect("Invalid JSON Object Received");
 
     let dossier_obj: Value =
-        serde_json::from_str(&json_obj.as_str().unwrap()).expect("Invalid Dossier JSON");
+        serde_json::from_str(json_obj.as_str().unwrap()).expect("Invalid Dossier JSON");
     let mut m3u8_link: String = dossier_obj.get("hls_source").unwrap().to_string();
     m3u8_link.retain(|c| c != '"');
 
@@ -89,6 +112,7 @@ async fn obtain_user_status(
 // 2. Query all waiting users, check if any of them came online
 // 3. If any of the waiting users are online start a downloader thread and update their state in the DB
 async fn status_loop(
+    configuration: DownloaderConfig,
     rx_channel: Arc<Receiver<downloader::StreamerUpdate>>,
     tx_channel: Arc<Sender<downloader::StreamerUpdate>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -106,7 +130,7 @@ async fn status_loop(
                 error!("No heartbeat received!");
             }
         }
-        return hb_received;
+        hb_received
     });
     if !hb_task.await? {
         return Err(Box::new(downloader::HeartbeatError::new()));
@@ -120,7 +144,10 @@ async fn status_loop(
         // TODO: Need to detect when a user has been manually stopped correctly, I think empty requests are failing
         debug!("get stopped users ...");
         let stopped_users_resp = streamer_api_client
-            .get("http://127.0.0.1:8000/users/state/stopped")
+            .get(format!(
+                "http://{}/users/state/stopped",
+                configuration.backend_url
+            ))
             .send()
             .await
             .unwrap();
@@ -135,7 +162,10 @@ async fn status_loop(
         }
         debug!("get waiting users ...");
         let waiting_users_resp = streamer_api_client
-            .get("http://127.0.0.1:8000/users/state/waiting")
+            .get(format!(
+                "http://{}/users/state/waiting",
+                configuration.backend_url
+            ))
             .send()
             .await
             .unwrap();
@@ -159,7 +189,10 @@ async fn status_loop(
                         download_size_mb: 0,
                     };
                     streamer_api_client
-                        .post(format!("http://127.0.0.1:8000/users/{}", user.profile_name))
+                        .post(format!(
+                            "http://{}/users/{}",
+                            configuration.backend_url, user.profile_name
+                        ))
                         .json(&new_user_status)
                         .send()
                         .await
@@ -172,17 +205,30 @@ async fn status_loop(
                 }
                 OnlineState::Offline => trace!("Offline"),
             }
-            sleep(tokio::time::Duration::from_secs(5)).await;
+            sleep(tokio::time::Duration::from_secs(
+                configuration.sleep_time_between_statusing,
+            ))
+            .await;
         }
-        sleep(tokio::time::Duration::from_secs(5)).await;
+        sleep(tokio::time::Duration::from_secs(
+            configuration.main_loop_sleep_time,
+        ))
+        .await;
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cfg: DownloaderConfig = Figment::new()
+        .merge(Serialized::defaults(DownloaderConfig::default()))
+        .merge(Toml::file("config.toml"))
+        .merge(Env::prefixed("DL_"))
+        .extract()
+        .unwrap();
     Builder::new()
         .filter_level(log::LevelFilter::Info)
         .target(env_logger::Target::Stdout)
+        .parse_default_env()
         .init();
     let (statuser_tx, downloader_rx) = unbounded::<downloader::StreamerUpdate>();
     let (downloader_tx, statuser_rx) = unbounded::<downloader::StreamerUpdate>();
@@ -195,8 +241,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status_rx_ptr = Arc::new(statuser_rx);
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
+    let cfg_clone = cfg.clone();
     tokio::select! {
-        ret = status_loop(status_rx_ptr, status_tx_ptr.clone()) => {
+        ret = status_loop(cfg_clone, status_rx_ptr, status_tx_ptr.clone()) => {
             if let Err(e) = ret {
                 error!("Status Loop Crashed! {}", e);
                 return Err(e);

@@ -1,6 +1,6 @@
 [package]
 name = "stream-downloader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -14,3 +14,4 @@ jiff = "0.2.13"
 nix = { version = "0.30.1", features = ["signal"] }
 env_logger = "0.11.8"
 log = "0.4.27"
+figment = { version = "0.10.19", features = ["toml", "env"] }

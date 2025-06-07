@@ -17,6 +17,12 @@ pub struct HeartbeatError {
     details: String,
 }
 
+impl Default for HeartbeatError {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HeartbeatError {
     pub fn new() -> Self {
         Self {
@@ -95,9 +101,9 @@ impl DownloaderProc {
 
     fn get_proc_status(&mut self) -> Option<ExitStatus> {
         if let Some(proc) = self.handle.as_mut() {
-            return proc.try_wait().unwrap();
+            proc.try_wait().unwrap()
         } else {
-            return None;
+            None
         }
     }
 
@@ -131,21 +137,21 @@ impl DownloaderProc {
                             "SIGTERM didn't stop process so used SIGKILL for: {}",
                             self.name
                         );
-                        return Ok(());
+                        Ok(())
                     }
                     Err(e) => {
                         error!("couldn't stop process");
-                        return Err(e.into());
+                        Err(e.into())
                     }
                 }
             } else {
                 debug!("stopped downloader for: {}", self.name);
-                return Ok(());
+                Ok(())
             }
         } else {
-            return Err(Box::new(DownloaderError::new(
+            Err(Box::new(DownloaderError::new(
                 "No Active Process for Downloading User",
-            )));
+            )))
         }
     }
 }
