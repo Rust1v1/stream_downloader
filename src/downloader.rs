@@ -1,6 +1,7 @@
 use crate::Streamer;
 use crossbeam::channel::{Receiver, Sender};
 use jiff::{Timestamp, tz::TimeZone};
+use log::{debug, error, info, warn};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::fmt;
@@ -117,7 +118,7 @@ impl DownloaderProc {
     }
 
     fn stop_downloading(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        println!("Stopping Downloader for {}", self.name);
+        debug!("stopping downloader for {}", self.name);
         if let Some(proc) = self.handle.as_mut() {
             let pid = Pid::from_raw(proc.id() as i32);
             kill(pid, Signal::SIGINT)?;
@@ -126,19 +127,19 @@ impl DownloaderProc {
             if proc.try_wait().unwrap().is_none() {
                 match proc.kill() {
                     Ok(()) => {
-                        println!(
-                            "WARN: SIGTERM didn't stop process so used SIGKILL for: {}",
+                        warn!(
+                            "SIGTERM didn't stop process so used SIGKILL for: {}",
                             self.name
                         );
                         return Ok(());
                     }
                     Err(e) => {
-                        println!("ERROR: couldn't stop process");
+                        error!("couldn't stop process");
                         return Err(e.into());
                     }
                 }
             } else {
-                println!("DEBUG: Stopped downloader for: {}", self.name);
+                debug!("stopped downloader for: {}", self.name);
                 return Ok(());
             }
         } else {
@@ -153,7 +154,7 @@ pub fn download_manager(
     rx_channel: Arc<Receiver<StreamerUpdate>>,
     tx_channel: Arc<Sender<StreamerUpdate>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting Downloader Thread");
+    info!("starting downloader thread");
     let mut isrunning = true;
     // Create hashmap here
     let mut downloaders: Vec<DownloaderProc> = Vec::new();
@@ -162,7 +163,7 @@ pub fn download_manager(
         action: StreamerAction::Heartbeat,
     })?;
     while isrunning {
-        println!("Debug: {} Streams Running", downloaders.len());
+        debug!("{} streams running", downloaders.len());
         // Check Status of all currently managed processes
         // Check for any messages
         let mut to_remove = Vec::new();
@@ -177,11 +178,11 @@ pub fn download_manager(
         }
 
         for msg in rx_channel.try_iter() {
-            println!("Handling Message for {}.", msg.streamer.profile_name);
+            debug!("handling Message for {}.", msg.streamer.profile_name);
             match msg.action {
                 StreamerAction::Start(m3u8) => {
                     let mut new_downloader = DownloaderProc::new(&m3u8, &msg.streamer.profile_name);
-                    println!("Starting {}", new_downloader.name);
+                    debug!("starting download process for {}", new_downloader.name);
                     new_downloader.start_downloading()?;
                     downloaders.push(new_downloader);
                 }
@@ -196,7 +197,7 @@ pub fn download_manager(
                 StreamerAction::StopAll => {
                     // When this happens it seems borderline random whether or not there's any "known about" running streams. I have no idea what's happening to the downloaders vector. But the processes in them are successfully exiting.
                     // Actually what's probably happening is the child process is somehow consuming the control-c, stopping, then getting automatically removed from the vector. Don't know how that's happening
-                    println!("DEBUG. Stop {} Stream(s) and Exit.", downloaders.len());
+                    warn!("stop {} stream(s) and exit.", downloaders.len());
                     isrunning = false;
                     downloaders
                         .iter_mut()
@@ -206,7 +207,7 @@ pub fn download_manager(
                     break;
                 }
                 _ => {
-                    println!("ERROR! Heartbeat received erroneously");
+                    error!("heartbeat received erroneously");
                 }
             }
         }
