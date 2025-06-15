@@ -107,6 +107,73 @@ async fn obtain_user_status(
     }
 }
 
+async fn obtain_user_status_retry(
+    streamer: &Streamer,
+    client: &Client,
+    room_regex: &Regex,
+    retry_count: u32,
+) -> Result<OnlineState, reqwest::Error> {
+    let mut retries: u32 = 0;
+    let base_delay_secs: u32 = 1;
+
+    loop {
+        match client.get(streamer.profile_url.clone()).send().await {
+            Ok(streamer_resp) => {
+                if streamer_resp.status().is_success() {
+                    let client_html = streamer_resp.text().await?;
+
+                    let dossier_json_str: &str = room_regex
+                        .captures(&client_html)
+                        .and_then(|captures| captures.get(1))
+                        .expect("No Valid Regex Found")
+                        .as_str();
+                    let json_obj: Value = serde_json::from_str(dossier_json_str)
+                        .expect("Invalid JSON Object Received");
+
+                    let dossier_obj: Value = serde_json::from_str(json_obj.as_str().unwrap())
+                        .expect("Invalid Dossier JSON");
+                    let mut m3u8_link: String = dossier_obj.get("hls_source").unwrap().to_string();
+                    m3u8_link.retain(|c| c != '"');
+
+                    if m3u8_link.len() > 2 && m3u8_link.ends_with("m3u8") {
+                        return Ok(OnlineState::Online(m3u8_link));
+                    } else {
+                        return Ok(OnlineState::Offline);
+                    }
+                } else {
+                    warn!(
+                        "Error Obtaining Status for User {}: {}",
+                        streamer.profile_name,
+                        streamer_resp.status()
+                    );
+                    if retries < retry_count {
+                        retries += 1;
+                        debug!("Trying to status that user again");
+                        let delay = base_delay_secs * 2u32.pow(retries - 1);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(delay as u64)).await;
+                    } else {
+                        return Err(streamer_resp.error_for_status().unwrap_err());
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Error Obtaining Status for User {}: {}",
+                    streamer.profile_name, e
+                );
+                if retries < retry_count {
+                    retries += 1;
+                    debug!("Trying to status that user again");
+                    let delay = base_delay_secs * 2u32.pow(retries - 1);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(delay as u64)).await;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
 // Main status loop
 // 1. Query for any users manually stopped and kill their downloads
 // 2. Query all waiting users, check if any of them came online
@@ -155,6 +222,7 @@ async fn status_loop(
         let stopped_users: Vec<Streamer> =
             stopped_users_resp.json::<Vec<Streamer>>().await.unwrap();
         for user in stopped_users {
+            info!("Stopping user: {}", user.profile_name);
             tx_channel.send(downloader::StreamerUpdate {
                 streamer: user,
                 action: downloader::StreamerAction::Stop,
@@ -174,14 +242,14 @@ async fn status_loop(
             waiting_users_resp.json::<Vec<Streamer>>().await.unwrap();
         for user in waiting_users {
             debug!("statusing: {}", user.profile_name);
-            // Handle This Error then handle whether or not they're online
+            // TODO: Handle This Error then handle whether or not they're online
             let state: OnlineState =
-                obtain_user_status(&user, &streamer_statuser_client, &room_regex)
+                obtain_user_status_retry(&user, &streamer_statuser_client, &room_regex, 4)
                     .await
                     .unwrap();
             match state {
                 OnlineState::Online(m3u8) => {
-                    debug!("user {} is online. link: {}", user.profile_name, m3u8);
+                    info!("user {} is online. link: {}", user.profile_name, m3u8);
                     let new_user_status = Streamer {
                         profile_name: user.profile_name.clone(),
                         profile_url: user.profile_url.clone(),
@@ -255,6 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = sigterm.recv() => warn!("received SIGTERM"),
             }
         } => {
+            // TODO: reset the state of all downloading streams to waiting, maybe create an endpoint for that
             info!("Entering Shutdown State");
             status_tx_ptr.send(downloader::StreamerUpdate{
                 streamer: Streamer {
