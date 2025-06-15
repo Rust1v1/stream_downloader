@@ -108,6 +108,7 @@ impl DownloaderProc {
     }
 
     fn start_downloading(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // TODO: Set this to be configurable, shouldn't be /tmp/ hardcoded
         let stdout_file = File::create(format!("/tmp/{}-stdout.log", self.name))?;
         let stderr_file = File::create(format!("/tmp/{}-stderr.log", self.name))?;
         let proc = Command::new("ffmpeg")
@@ -123,30 +124,54 @@ impl DownloaderProc {
         Ok(())
     }
 
-    fn stop_downloading(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        debug!("stopping downloader for {}", self.name);
+    fn send_sigint(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        debug!("sending SIGINT downloader {} downloader", self.name);
         if let Some(proc) = self.handle.as_mut() {
             let pid = Pid::from_raw(proc.id() as i32);
-            kill(pid, Signal::SIGINT)?;
-            // After killing, sleep for 250 ms, check on the status, if it's not stopped kill it
-            thread::sleep(Duration::from_millis(250));
-            if proc.try_wait().unwrap().is_none() {
-                match proc.kill() {
-                    Ok(()) => {
-                        warn!(
-                            "SIGTERM didn't stop process so used SIGKILL for: {}",
-                            self.name
+            Ok(kill(pid, Signal::SIGINT)?)
+        } else {
+            Err(Box::new(DownloaderError::new(
+                "No Active Process for Downloading User",
+            )))
+        }
+    }
+
+    fn cleanup_process(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        debug!("stopping downloader for {}", self.name);
+        if let Some(proc) = self.handle.as_mut() {
+            let mut counter = 0;
+            // After sending sigint check every 250 ms if it's alive, after 3 seconds kill it
+            loop {
+                thread::sleep(Duration::from_millis(250));
+                if proc.try_wait().unwrap().is_none() {
+                    // 12 becuase 3 seconds in chunks of 250ms is 12
+                    // TODO: clean this up
+                    if counter >= 12 {
+                        match proc.kill() {
+                            Ok(()) => {
+                                warn!(
+                                    "SIGINT didn't stop process so used SIGKILL for: {}",
+                                    self.name
+                                );
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Process couldn't be stopped by SIGINT or SIGKILL. Let OS clean it up."
+                                );
+                                return Err(e.into());
+                            }
+                        }
+                    } else {
+                        debug!(
+                            "process hasn't been fully cleaned up yet. will wait up to 3 seconds before exiting"
                         );
-                        Ok(())
+                        counter += 1;
                     }
-                    Err(e) => {
-                        error!("couldn't stop process");
-                        Err(e.into())
-                    }
+                } else {
+                    debug!("stopped downloader for: {}", self.name);
+                    return Ok(());
                 }
-            } else {
-                debug!("stopped downloader for: {}", self.name);
-                Ok(())
             }
         } else {
             Err(Box::new(DownloaderError::new(
@@ -198,16 +223,28 @@ pub fn download_manager(
                         .iter_mut()
                         .find(|dl| dl.name == msg.streamer.profile_name)
                         .unwrap()
-                        .stop_downloading()?;
+                        .send_sigint()?;
+
+                    downloaders
+                        .iter_mut()
+                        .find(|dl| dl.name == msg.streamer.profile_name)
+                        .unwrap()
+                        .cleanup_process()?;
                 }
                 StreamerAction::StopAll => {
                     // When this happens it seems borderline random whether or not there's any "known about" running streams. I have no idea what's happening to the downloaders vector. But the processes in them are successfully exiting.
                     // Actually what's probably happening is the child process is somehow consuming the control-c, stopping, then getting automatically removed from the vector. Don't know how that's happening
-                    warn!("stop {} stream(s) and exit.", downloaders.len());
+                    warn!(
+                        "Stop All Command received. Stopping {} stream(s) and exiting.",
+                        downloaders.len()
+                    );
                     isrunning = false;
                     downloaders
                         .iter_mut()
-                        .for_each(|dl| dl.stop_downloading().unwrap());
+                        .for_each(|dl| dl.send_sigint().unwrap());
+                    downloaders
+                        .iter_mut()
+                        .for_each(|dl| dl.cleanup_process().unwrap());
                     downloaders.clear();
                     // Break the for loop
                     break;
