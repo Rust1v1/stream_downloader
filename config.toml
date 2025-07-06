@@ -1,3 +1,7 @@
 backend_url = "127.0.0.1:8000"
+download_dir = "/path/to/downloads"
+log_dir = "/path/to/logs"
 main_loop_sleep_time = 2
 sleep_time_between_statusing = 5
+max_parallel_downloads = 4
+enable_downloader = true

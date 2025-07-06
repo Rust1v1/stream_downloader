@@ -9,17 +9,23 @@ use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::json;
 use std::sync::Arc;
 use std::thread;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::sleep;
+
+use crate::downloader::StreamerAction;
 
 pub mod downloader;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DownloaderConfig {
     backend_url: String,
+    download_dir: String,
+    log_dir: String,
     enable_downloader: bool,
+    max_parallel_downloads: usize,
     main_loop_sleep_time: u64,
     sleep_time_between_statusing: u64,
 }
@@ -28,7 +34,10 @@ impl Default for DownloaderConfig {
     fn default() -> DownloaderConfig {
         DownloaderConfig {
             backend_url: String::from("http://127.0.0.1:8000"),
+            download_dir: String::from("/tmp"),
+            log_dir: String::from("/tmp"),
             enable_downloader: true,
+            max_parallel_downloads: 2,
             main_loop_sleep_time: 5,
             sleep_time_between_statusing: 5,
         }
@@ -54,12 +63,12 @@ enum OnlineState {
     Offline,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Streamer {
     profile_url: String,
     profile_name: String,
     profile_status: StreamerState,
-    download_size_mb: u32,
+    download_size_mb: u64,
 }
 
 impl Default for Streamer {
@@ -174,6 +183,21 @@ async fn obtain_user_status_retry(
     }
 }
 
+async fn return_users_to_waiting(url: &str) {
+    info!("setting all user states to waiting");
+    let streamer_api_client = Client::new();
+    streamer_api_client
+        .post(format!("{}", url))
+        .json(&json!({
+            "profile_status": "waiting",
+            "download_size_mb": 0,
+        }))
+        .send()
+        .await
+        .unwrap();
+    info!("done");
+}
+
 // Main status loop
 // 1. Query for any users manually stopped and kill their downloads
 // 2. Query all waiting users, check if any of them came online
@@ -207,8 +231,72 @@ async fn status_loop(
     let streamer_api_client = Client::new();
     let streamer_statuser_client = Client::new();
     let room_regex: Regex = Regex::new(r#"window\.initialRoomDossier\s*=\s*("(?:\\.|[^\\"])*")"#)?;
+    let dl_rx = Arc::clone(&rx_channel);
     loop {
-        // TODO: Need to detect when a user has been manually stopped correctly, I think empty requests are failing
+        debug!("get currently downloading users");
+        let active_users_resp = streamer_api_client
+            .get(format!(
+                "http://{}/users/state/downloading",
+                configuration.backend_url
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        // Handle this, don't just unwrap
+        // TODO: Make this mutable and remove the streamer object from it when it detects a stream has stopped
+        let mut active_users: Vec<Streamer> =
+            if let Ok(users) = active_users_resp.json::<Vec<Streamer>>().await {
+                users
+            } else {
+                debug!("no currently downloading users");
+                vec![]
+            };
+
+        trace!("currently active users: {:#?}", active_users);
+
+        debug!("get stream updates from the downloader");
+        while let Ok(update) = dl_rx.try_recv() {
+            debug!(
+                "user: {} sent action: {:?}",
+                update.streamer.profile_name, update.action,
+            );
+            // TODO: This cannot be unwrapped as it could very well return a None
+            // TODO: Query the API for the specific user actually?
+            if let Some(user_idx) = active_users
+                .iter()
+                .position(|s| s.profile_name == update.streamer.profile_name)
+            {
+                let mut new_user_status = active_users.get(user_idx).unwrap().clone();
+                match update.action {
+                    StreamerAction::Stop => {
+                        new_user_status.profile_status = StreamerState::Waiting;
+                        active_users.remove(user_idx);
+                    }
+                    StreamerAction::Update => {
+                        new_user_status.download_size_mb = update.streamer.download_size_mb
+                    }
+                    _ => panic!("unexpected action received from downloader"),
+                }
+                streamer_api_client
+                    .post(format!(
+                        "http://{}/users/{}",
+                        configuration.backend_url,
+                        new_user_status.profile_name.clone()
+                    ))
+                    .json(&new_user_status)
+                    .send()
+                    .await
+                    .unwrap();
+            } else {
+                error!(
+                    "downloader sent update for user: {} which is not in the downloading users list: {:?}",
+                    update.streamer.profile_name, active_users,
+                );
+            }
+        }
+
+        // TODO: (I THINK THIS IS FIXED) I think empty requests are failing, i.e the response when there's no stopped users.
         debug!("get stopped users ...");
         let stopped_users_resp = streamer_api_client
             .get(format!(
@@ -218,15 +306,44 @@ async fn status_loop(
             .send()
             .await
             .unwrap();
-        // Handle this, don't just unwrap
+
         let stopped_users: Vec<Streamer> =
-            stopped_users_resp.json::<Vec<Streamer>>().await.unwrap();
+            if let Ok(users) = stopped_users_resp.json::<Vec<Streamer>>().await {
+                users
+            } else {
+                debug!("no currently stopped users");
+                vec![]
+            };
+
+        // TODO: This will currently run for every stopped user every time which we don't want. Should add a state called "stopping" for this, and check for stopping states instead of stopped
+        // TODO: This is also broken because in order to drive this change the API is updated so there is almost no change for there to be a time that the user is in the active list and will be return as a stopped user.
+        // Chicken and egg problem
         for user in stopped_users {
-            info!("Stopping user: {}", user.profile_name);
-            tx_channel.send(downloader::StreamerUpdate {
-                streamer: user,
-                action: downloader::StreamerAction::Stop,
-            })?;
+            if let Some(user_idx) = active_users
+                .iter()
+                .position(|s| s.profile_name == user.profile_name)
+            {
+                active_users.remove(user_idx);
+                info!("Stopping user: {}", user.profile_name);
+                tx_channel.send(downloader::StreamerUpdate {
+                    streamer: user.clone(),
+                    action: downloader::StreamerAction::Stop,
+                })?;
+            } else {
+                debug!(
+                    "user {} was manually stopped, but the user is not in the downloading users list: {:#?}",
+                    user.profile_name, active_users
+                );
+            }
+        }
+
+        if active_users.len() >= configuration.max_parallel_downloads {
+            debug!("no available threads for downloaders, not statusing...");
+            sleep(tokio::time::Duration::from_secs(
+                configuration.main_loop_sleep_time,
+            ))
+            .await;
+            continue;
         }
         debug!("get waiting users ...");
         let waiting_users_resp = streamer_api_client
@@ -237,9 +354,13 @@ async fn status_loop(
             .send()
             .await
             .unwrap();
-        // Handle this, don't just unwrap
         let waiting_users: Vec<Streamer> =
-            waiting_users_resp.json::<Vec<Streamer>>().await.unwrap();
+            if let Ok(users) = waiting_users_resp.json::<Vec<Streamer>>().await {
+                users
+            } else {
+                debug!("no currently waiting users");
+                vec![]
+            };
         for user in waiting_users {
             debug!("statusing: {}", user.profile_name);
             // TODO: Handle This Error then handle whether or not they're online
@@ -302,8 +423,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (downloader_tx, statuser_rx) = unbounded::<downloader::StreamerUpdate>();
     let dl_tx_ptr = Arc::new(downloader_tx);
     let dl_rx_ptr = Arc::new(downloader_rx);
+    let dl_dir = cfg.download_dir.clone();
+    let log_dir = cfg.log_dir.clone();
     let downloader_thread_handle = thread::spawn(move || {
-        let _res = downloader::download_manager(dl_rx_ptr, dl_tx_ptr);
+        let _res = downloader::download_manager(dl_rx_ptr, dl_tx_ptr, &dl_dir, &log_dir);
     });
     let status_tx_ptr = Arc::new(statuser_tx);
     let status_rx_ptr = Arc::new(statuser_rx);
@@ -314,6 +437,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ret = status_loop(cfg_clone, status_rx_ptr, status_tx_ptr.clone()) => {
             if let Err(e) = ret {
                 error!("Status Loop Crashed! {}", e);
+                status_tx_ptr.send(downloader::StreamerUpdate{
+                    streamer: Streamer {
+                            profile_url: "N/A".to_string(),
+                            profile_name: "N/A".to_string(),
+                            profile_status: StreamerState::Stopped,
+                            download_size_mb: 0 },
+                    action: downloader::StreamerAction::StopAll
+                })?;
+                return_users_to_waiting(&format!("http://{}/users", cfg.backend_url)).await;
                 return Err(e);
             }
         }
@@ -323,7 +455,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = sigterm.recv() => warn!("received SIGTERM"),
             }
         } => {
-            // TODO: reset the state of all downloading streams to waiting, maybe create an endpoint for that
             info!("Entering Shutdown State");
             status_tx_ptr.send(downloader::StreamerUpdate{
                 streamer: Streamer {
@@ -333,6 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         download_size_mb: 0 },
                 action: downloader::StreamerAction::StopAll
             })?;
+            return_users_to_waiting(&format!("http://{}/users", cfg.backend_url)).await;
         }
     }
     let _thread_res = downloader_thread_handle.join();
