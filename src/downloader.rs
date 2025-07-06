@@ -1,7 +1,7 @@
 use crate::Streamer;
 use crossbeam::channel::{Receiver, Sender};
 use jiff::{Timestamp, tz::TimeZone};
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::fmt;
@@ -60,11 +60,13 @@ impl fmt::Display for DownloaderError {
     }
 }
 
+#[derive(Clone, Debug)]
 pub enum StreamerAction {
     Heartbeat,
     Start(String),
     Stop,
     StopAll,
+    Update,
 }
 
 pub struct StreamerUpdate {
@@ -75,26 +77,45 @@ pub struct StreamerUpdate {
 pub struct DownloaderProc {
     m3u8_url: String,
     name: String,
-    download_file: PathBuf,
+    download_path: PathBuf,
+    stdout_log_path: PathBuf,
+    stderr_log_path: PathBuf,
     handle: Option<Child>,
 }
 
+fn sanitize_directory_path(dir: &str) -> Option<PathBuf> {
+    let dir_meta =
+        std::fs::metadata(dir).expect(&format!("could not get information on directory {dir}"));
+    if !dir_meta.is_dir() {
+        error!("tried to sanitize a directory path {dir} that's not a directory");
+        return None;
+    }
+    if dir_meta.permissions().readonly() {
+        error!("directory path {dir} is readonly");
+        return None;
+    }
+    Some(dir.into())
+}
+
 impl DownloaderProc {
-    fn new(url: &str, name: &str) -> DownloaderProc {
-        // fixme: this needs to be configurable
-        let out_path = String::from("/tmp");
-        let filename = format!(
-            "{}/{}-{}.mp4",
-            out_path,
-            name,
-            Timestamp::now()
-                .to_zoned(TimeZone::system())
-                .strftime("%H_%M_%S-%m_%d_%Y")
-        );
+    fn new(url: &str, name: &str, output_dir: &str, log_dir: &str) -> DownloaderProc {
+        let now = Timestamp::now()
+            .to_zoned(TimeZone::system())
+            .strftime("%H_%M_%S-%m_%d_%Y");
+
+        let mut output_path = sanitize_directory_path(output_dir).unwrap();
+        let mut log_path = sanitize_directory_path(log_dir).unwrap();
+        let mut err_log_path = log_path.clone();
+
+        output_path.push(format!("{}-{}.mp4", name, now));
+        log_path.push(format!("{}-stdout-{}.log", name, now));
+        err_log_path.push(format!("{}-stderr-{}.log", name, now));
         DownloaderProc {
             m3u8_url: String::from(url),
             name: String::from(name),
-            download_file: filename.into(),
+            download_path: output_path,
+            stdout_log_path: log_path,
+            stderr_log_path: err_log_path,
             handle: None,
         }
     }
@@ -107,16 +128,26 @@ impl DownloaderProc {
         }
     }
 
+    fn get_size_of_download_mb(&self) -> Option<u64> {
+        std::fs::metadata(&self.download_path)
+            .map(|meta| meta.len() / 1_000_000)
+            .inspect_err(|_| warn!("output file {:?} does not exist!", self.download_path))
+            .ok()
+    }
+
     fn start_downloading(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // TODO: Set this to be configurable, shouldn't be /tmp/ hardcoded
-        let stdout_file = File::create(format!("/tmp/{}-stdout.log", self.name))?;
-        let stderr_file = File::create(format!("/tmp/{}-stderr.log", self.name))?;
+        debug!(
+            "{}: output file: {:?} | log file: {:?}",
+            self.name, self.download_path, self.stderr_log_path
+        );
+        let stdout_file = File::create(&self.stdout_log_path)?;
+        let stderr_file = File::create(&self.stderr_log_path)?;
         let proc = Command::new("ffmpeg")
             .arg("-i")
             .arg(&self.m3u8_url)
             .arg("-c")
             .arg("copy")
-            .arg(self.download_file.as_path())
+            .arg(self.download_path.as_path())
             .stdout(stdout_file)
             .stderr(stderr_file)
             .spawn()?;
@@ -184,10 +215,12 @@ impl DownloaderProc {
 pub fn download_manager(
     rx_channel: Arc<Receiver<StreamerUpdate>>,
     tx_channel: Arc<Sender<StreamerUpdate>>,
+    download_directory: &str,
+    log_directory: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("starting downloader thread");
     let mut isrunning = true;
-    // Create hashmap here
+    // TODO: Create hashmap here?
     let mut downloaders: Vec<DownloaderProc> = Vec::new();
     tx_channel.send(StreamerUpdate {
         streamer: Streamer::default(),
@@ -200,19 +233,41 @@ pub fn download_manager(
         let mut to_remove = Vec::new();
         for (idx, downloader) in downloaders.iter_mut().enumerate() {
             if downloader.get_proc_status().is_some() {
+                info!("stream for {} has finished", downloader.name);
                 to_remove.push(idx);
+                tx_channel.send(StreamerUpdate {
+                    streamer: Streamer {
+                        profile_name: downloader.name.clone(),
+                        download_size_mb: downloader.get_size_of_download_mb().unwrap_or(0),
+                        ..Default::default()
+                    },
+                    action: StreamerAction::Stop,
+                })?;
+            } else {
+                trace!("sending update for {}", downloader.name);
+                tx_channel.send(StreamerUpdate {
+                    streamer: Streamer {
+                        profile_name: downloader.name.clone(),
+                        download_size_mb: downloader.get_size_of_download_mb().unwrap_or(0),
+                        ..Default::default()
+                    },
+                    action: StreamerAction::Update,
+                })?;
             }
         }
-
         for idx in to_remove {
             downloaders.remove(idx);
         }
-
         for msg in rx_channel.try_iter() {
             debug!("handling Message for {}.", msg.streamer.profile_name);
             match msg.action {
                 StreamerAction::Start(m3u8) => {
-                    let mut new_downloader = DownloaderProc::new(&m3u8, &msg.streamer.profile_name);
+                    let mut new_downloader = DownloaderProc::new(
+                        &m3u8,
+                        &msg.streamer.profile_name,
+                        download_directory,
+                        log_directory,
+                    );
                     debug!("starting download process for {}", new_downloader.name);
                     new_downloader.start_downloading()?;
                     downloaders.push(new_downloader);
@@ -246,16 +301,16 @@ pub fn download_manager(
                         .iter_mut()
                         .for_each(|dl| dl.cleanup_process().unwrap());
                     downloaders.clear();
-                    // Break the for loop
                     break;
                 }
                 _ => {
                     error!("heartbeat received erroneously");
                 }
             }
+            debug!("handled user: {}", msg.streamer.profile_name);
         }
         if isrunning {
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(2));
         }
     }
     Ok(())
