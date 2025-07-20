@@ -54,6 +54,8 @@ pub enum StreamerState {
     Downloading,
     #[serde(rename = "stopped")]
     Stopped,
+    #[serde(rename = "stopping")]
+    Stopping,
     #[serde(rename = "error")]
     Error(u32),
 }
@@ -296,19 +298,18 @@ async fn status_loop(
             }
         }
 
-        // TODO: (I THINK THIS IS FIXED) I think empty requests are failing, i.e the response when there's no stopped users.
-        debug!("get stopped users ...");
-        let stopped_users_resp = streamer_api_client
+        debug!("get users that have been manually requested to stop");
+        let stopping_users_resp = streamer_api_client
             .get(format!(
-                "http://{}/users/state/stopped",
+                "http://{}/users/state/stopping",
                 configuration.backend_url
             ))
             .send()
             .await
             .unwrap();
 
-        let stopped_users: Vec<Streamer> =
-            if let Ok(users) = stopped_users_resp.json::<Vec<Streamer>>().await {
+        let stopping_users: Vec<Streamer> =
+            if let Ok(users) = stopping_users_resp.json::<Vec<Streamer>>().await {
                 users
             } else {
                 debug!("no currently stopped users");
@@ -318,23 +319,37 @@ async fn status_loop(
         // TODO: This will currently run for every stopped user every time which we don't want. Should add a state called "stopping" for this, and check for stopping states instead of stopped
         // TODO: This is also broken because in order to drive this change the API is updated so there is almost no change for there to be a time that the user is in the active list and will be return as a stopped user.
         // Chicken and egg problem
-        for user in stopped_users {
+        for user in stopping_users {
             if let Some(user_idx) = active_users
                 .iter()
                 .position(|s| s.profile_name == user.profile_name)
             {
                 active_users.remove(user_idx);
-                info!("Stopping user: {}", user.profile_name);
-                tx_channel.send(downloader::StreamerUpdate {
-                    streamer: user.clone(),
-                    action: downloader::StreamerAction::Stop,
-                })?;
             } else {
                 debug!(
-                    "user {} was manually stopped, but the user is not in the downloading users list: {:#?}",
-                    user.profile_name, active_users
+                    "user {} was manually requested to stop but user has already been removed from active users list",
+                    user.profile_name
                 );
             }
+            info!("Stopping user: {}", user.profile_name);
+            tx_channel.send(downloader::StreamerUpdate {
+                streamer: user.clone(),
+                action: downloader::StreamerAction::Stop,
+            })?;
+            streamer_api_client
+                .post(format!(
+                    "http://{}/users/{}",
+                    configuration.backend_url, user.profile_name
+                ))
+                .json(&Streamer {
+                    profile_name: user.profile_name.clone(),
+                    profile_url: user.profile_url.clone(),
+                    profile_status: StreamerState::Stopped,
+                    download_size_mb: 0,
+                })
+                .send()
+                .await
+                .unwrap();
         }
 
         if active_users.len() >= configuration.max_parallel_downloads {
@@ -392,7 +407,10 @@ async fn status_loop(
                         action: downloader::StreamerAction::Start(m3u8.clone()),
                     })?;
                 }
-                OnlineState::Offline => trace!("Offline"),
+                OnlineState::Offline => debug!(
+                    "user {} is offline, away, or in private.",
+                    user.profile_name
+                ),
             }
             sleep(tokio::time::Duration::from_secs(
                 configuration.sleep_time_between_statusing,
