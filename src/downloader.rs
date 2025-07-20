@@ -274,17 +274,19 @@ pub fn download_manager(
                 }
                 StreamerAction::Stop => {
                     // find the downloader in the list, stop it, and remove it
-                    downloaders
+                    let focused_downloader = downloaders
                         .iter_mut()
-                        .find(|dl| dl.name == msg.streamer.profile_name)
-                        .unwrap()
-                        .send_sigint()?;
+                        .find(|dl| dl.name == msg.streamer.profile_name);
 
-                    downloaders
-                        .iter_mut()
-                        .find(|dl| dl.name == msg.streamer.profile_name)
-                        .unwrap()
-                        .cleanup_process()?;
+                    if let Some(dl) = focused_downloader {
+                        dl.send_sigint()?;
+                        dl.cleanup_process()?;
+                    } else {
+                        warn!(
+                            "tried to stop user {} that doesn't have an active downloader process",
+                            msg.streamer.profile_name
+                        )
+                    }
                 }
                 StreamerAction::StopAll => {
                     // When this happens it seems borderline random whether or not there's any "known about" running streams. I have no idea what's happening to the downloaders vector. But the processes in them are successfully exiting.
@@ -310,7 +312,7 @@ pub fn download_manager(
             debug!("handled user: {}", msg.streamer.profile_name);
         }
         if isrunning {
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_secs(4));
         }
     }
     Ok(())
