@@ -15,8 +15,6 @@ use std::thread;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::sleep;
 
-use crate::downloader::StreamerAction;
-
 pub mod downloader;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -189,7 +187,7 @@ async fn return_users_to_waiting(url: &str) {
     info!("setting all user states to waiting");
     let streamer_api_client = Client::new();
     streamer_api_client
-        .post(format!("{}", url))
+        .post(url.to_string())
         .json(&json!({
             "profile_status": "waiting",
             "download_size_mb": 0,
@@ -234,8 +232,16 @@ async fn status_loop(
     let streamer_statuser_client = Client::new();
     let room_regex: Regex = Regex::new(r#"window\.initialRoomDossier\s*=\s*("(?:\\.|[^\\"])*")"#)?;
     let dl_rx = Arc::clone(&rx_channel);
-    loop {
-        debug!("get currently downloading users");
+    'main: loop {
+        // TODO: Don't just crash here? Maybe loop until connection is made?
+        let active_statusing: bool = streamer_api_client
+            .get(format!("http://{}/statusing", configuration.backend_url))
+            .send()
+            .await?
+            .text()
+            .await?
+            .parse::<bool>()?;
+        trace!("get currently downloading users");
         let active_users_resp = streamer_api_client
             .get(format!(
                 "http://{}/users/state/downloading",
@@ -245,8 +251,6 @@ async fn status_loop(
             .await
             .unwrap();
 
-        // Handle this, don't just unwrap
-        // TODO: Make this mutable and remove the streamer object from it when it detects a stream has stopped
         let mut active_users: Vec<Streamer> =
             if let Ok(users) = active_users_resp.json::<Vec<Streamer>>().await {
                 users
@@ -258,43 +262,43 @@ async fn status_loop(
         trace!("currently active users: {:#?}", active_users);
 
         debug!("get stream updates from the downloader");
+        let mut updates: Vec<downloader::StreamerUpdate> = vec![];
         while let Ok(update) = dl_rx.try_recv() {
-            debug!(
-                "user: {} sent action: {:?}",
-                update.streamer.profile_name, update.action,
-            );
-            // TODO: This cannot be unwrapped as it could very well return a None
-            // TODO: Query the API for the specific user actually?
-            if let Some(user_idx) = active_users
+            updates.push(update);
+        }
+        updates.sort_by(|a, b| {
+            b.streamer
+                .download_size_mb
+                .cmp(&a.streamer.download_size_mb)
+        });
+        for user in active_users.iter() {
+            if let Some(update) = updates
                 .iter()
-                .position(|s| s.profile_name == update.streamer.profile_name)
+                .find(|u| u.streamer.profile_name == user.profile_name)
             {
-                let mut new_user_status = active_users.get(user_idx).unwrap().clone();
+                debug!("handling update for {}", update.streamer.profile_name);
+                trace!("action: {:?}", update.action);
+                let mut updated_streamer_status = user.clone();
                 match update.action {
-                    StreamerAction::Stop => {
-                        new_user_status.profile_status = StreamerState::Waiting;
-                        active_users.remove(user_idx);
+                    downloader::StreamerAction::Stop => {
+                        updated_streamer_status.profile_status = StreamerState::Waiting
                     }
-                    StreamerAction::Update => {
-                        new_user_status.download_size_mb = update.streamer.download_size_mb
+                    downloader::StreamerAction::Update => {
+                        updated_streamer_status.download_size_mb = update.streamer.download_size_mb
                     }
-                    _ => panic!("unexpected action received from downloader"),
+                    _ => unreachable!(),
                 }
                 streamer_api_client
                     .post(format!(
                         "http://{}/users/{}",
                         configuration.backend_url,
-                        new_user_status.profile_name.clone()
+                        update.streamer.profile_name.clone()
                     ))
-                    .json(&new_user_status)
+                    .json(&updated_streamer_status)
                     .send()
-                    .await
-                    .unwrap();
+                    .await?;
             } else {
-                error!(
-                    "downloader sent update for user: {} which is not in the downloading users list: {:?}",
-                    update.streamer.profile_name, active_users,
-                );
+                debug!("no updates received for user {}", user.profile_name);
             }
         }
 
@@ -316,9 +320,6 @@ async fn status_loop(
                 vec![]
             };
 
-        // TODO: This will currently run for every stopped user every time which we don't want. Should add a state called "stopping" for this, and check for stopping states instead of stopped
-        // TODO: This is also broken because in order to drive this change the API is updated so there is almost no change for there to be a time that the user is in the active list and will be return as a stopped user.
-        // Chicken and egg problem
         for user in stopping_users {
             if let Some(user_idx) = active_users
                 .iter()
@@ -352,13 +353,17 @@ async fn status_loop(
                 .unwrap();
         }
 
-        if active_users.len() >= configuration.max_parallel_downloads {
-            debug!("no available threads for downloaders, not statusing...");
+        if !active_statusing || active_users.len() >= configuration.max_parallel_downloads {
+            debug!(
+                "either statusing is disabled (enabled: {active_statusing}) or no available threads for downloaders, max threads: {}, active threads: {}.",
+                active_users.len(),
+                configuration.max_parallel_downloads
+            );
             sleep(tokio::time::Duration::from_secs(
                 configuration.main_loop_sleep_time,
             ))
             .await;
-            continue;
+            continue 'main;
         }
         debug!("get waiting users ...");
         let waiting_users_resp = streamer_api_client
@@ -551,4 +556,105 @@ fn offline_user_test() {
     println!("{}", m3u8_link);
 
     assert!(m3u8_link.is_empty());
+}
+
+#[test]
+fn test_message_handling() {
+    let active_users: Vec<Streamer> = vec![
+        Streamer {
+            profile_name: "user1".to_string(),
+            profile_url: "https://stream.site/user1".to_string(),
+            profile_status: StreamerState::Downloading,
+            download_size_mb: 123,
+        },
+        Streamer {
+            profile_name: "user2".to_string(),
+            profile_url: "https://stream.site/user2".to_string(),
+            profile_status: StreamerState::Downloading,
+            download_size_mb: 456,
+        },
+        Streamer {
+            profile_name: "user3".to_string(),
+            profile_url: "https://stream.site/user3".to_string(),
+            profile_status: StreamerState::Downloading,
+            download_size_mb: 1024,
+        },
+    ];
+
+    trace!("currently active users: {:#?}", active_users);
+
+    debug!("get stream updates from the downloader");
+    let mut updates: Vec<downloader::StreamerUpdate> = vec![
+        downloader::StreamerUpdate {
+            streamer: Streamer {
+                profile_name: "user1".to_string(),
+                profile_url: "https://stream.site/user1".to_string(),
+                profile_status: StreamerState::Downloading,
+                download_size_mb: 150,
+            },
+            action: downloader::StreamerAction::Update,
+        },
+        downloader::StreamerUpdate {
+            streamer: Streamer {
+                profile_name: "user2".to_string(),
+                profile_url: "https://stream.site/user2".to_string(),
+                profile_status: StreamerState::Downloading,
+                download_size_mb: 480,
+            },
+            action: downloader::StreamerAction::Update,
+        },
+        downloader::StreamerUpdate {
+            streamer: Streamer {
+                profile_name: "user1".to_string(),
+                profile_url: "https://stream.site/user1".to_string(),
+                profile_status: StreamerState::Downloading,
+                download_size_mb: 170,
+            },
+            action: downloader::StreamerAction::Update,
+        },
+        downloader::StreamerUpdate {
+            streamer: Streamer {
+                profile_name: "user2".to_string(),
+                profile_url: "https://stream.site/user2".to_string(),
+                profile_status: StreamerState::Stopped,
+                download_size_mb: 512,
+            },
+            action: downloader::StreamerAction::Stop,
+        },
+        downloader::StreamerUpdate {
+            streamer: Streamer {
+                profile_name: "user1".to_string(),
+                profile_url: "https://stream.site/user1".to_string(),
+                profile_status: StreamerState::Downloading,
+                download_size_mb: 190,
+            },
+            action: downloader::StreamerAction::Update,
+        },
+    ];
+    updates.sort_by(|a, b| {
+        b.streamer
+            .download_size_mb
+            .cmp(&a.streamer.download_size_mb)
+    });
+    println!("{:#?}", updates);
+    for user in active_users.iter() {
+        if let Some(update) = updates
+            .iter()
+            .find(|u| u.streamer.profile_name == user.profile_name)
+        {
+            let mut updated_streamer_status = user.clone();
+            match update.action {
+                downloader::StreamerAction::Stop => {
+                    updated_streamer_status.profile_status = StreamerState::Waiting
+                }
+                downloader::StreamerAction::Update => {
+                    updated_streamer_status.download_size_mb = update.streamer.download_size_mb
+                }
+                _ => unreachable!(),
+            }
+            println!("{:#?}", updated_streamer_status);
+        } else {
+            println!("no update received for user {}", user.profile_name);
+        }
+    }
 }
