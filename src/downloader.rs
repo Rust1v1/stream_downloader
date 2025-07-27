@@ -1,4 +1,4 @@
-use crate::Streamer;
+use crate::{Streamer, StreamerState};
 use crossbeam::channel::{Receiver, Sender};
 use jiff::{Timestamp, tz::TimeZone};
 use log::{debug, error, info, trace, warn};
@@ -60,7 +60,7 @@ impl fmt::Display for DownloaderError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamerAction {
     Heartbeat,
     Start(String),
@@ -69,6 +69,7 @@ pub enum StreamerAction {
     Update,
 }
 
+#[derive(Clone, Debug)]
 pub struct StreamerUpdate {
     pub streamer: Streamer,
     pub action: StreamerAction,
@@ -84,8 +85,8 @@ pub struct DownloaderProc {
 }
 
 fn sanitize_directory_path(dir: &str) -> Option<PathBuf> {
-    let dir_meta =
-        std::fs::metadata(dir).expect(&format!("could not get information on directory {dir}"));
+    let dir_meta = std::fs::metadata(dir)
+        .unwrap_or_else(|_| panic!("could not get information on directory {dir}"));
     if !dir_meta.is_dir() {
         error!("tried to sanitize a directory path {dir} that's not a directory");
         return None;
@@ -249,6 +250,7 @@ pub fn download_manager(
                     streamer: Streamer {
                         profile_name: downloader.name.clone(),
                         download_size_mb: downloader.get_size_of_download_mb().unwrap_or(0),
+                        profile_status: StreamerState::Downloading,
                         ..Default::default()
                     },
                     action: StreamerAction::Update,
