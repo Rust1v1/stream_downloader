@@ -108,9 +108,9 @@ impl DownloaderProc {
         let mut log_path = sanitize_directory_path(log_dir).unwrap();
         let mut err_log_path = log_path.clone();
 
-        output_path.push(format!("{}-{}.mp4", name, now));
-        log_path.push(format!("{}-stdout-{}.log", name, now));
-        err_log_path.push(format!("{}-stderr-{}.log", name, now));
+        output_path.push(format!("{name}-{now}.mp4"));
+        log_path.push(format!("{name}-stdout-{now}.log"));
+        err_log_path.push(format!("{name}-stderr-{now}.log"));
         DownloaderProc {
             m3u8_url: String::from(url),
             name: String::from(name),

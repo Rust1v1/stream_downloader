@@ -55,12 +55,14 @@ pub enum StreamerState {
     #[serde(rename = "stopping")]
     Stopping,
     #[serde(rename = "error")]
-    Error(u32),
+    Error(u16),
 }
 
+#[derive(Clone, Debug)]
 enum OnlineState {
     Online(String),
     Offline,
+    Error(u16),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -155,7 +157,13 @@ async fn obtain_user_status_retry(
                         streamer.profile_name,
                         streamer_resp.status()
                     );
-                    if retries < retry_count {
+                    if streamer_resp.status() == reqwest::StatusCode::NOT_FOUND {
+                        error!(
+                            "user {} statusing returned 404, not attempting to status again.",
+                            streamer.profile_name
+                        );
+                        return Err(streamer_resp.error_for_status().unwrap_err());
+                    } else if retries < retry_count {
                         retries += 1;
                         debug!("Trying to status that user again");
                         let delay = base_delay_secs * 2u32.pow(retries - 1);
@@ -259,7 +267,7 @@ async fn status_loop(
                 vec![]
             };
 
-        trace!("currently active users: {:#?}", active_users);
+        trace!("currently active users: {active_users:#?}");
 
         debug!("get stream updates from the downloader");
         let mut updates: Vec<downloader::StreamerUpdate> = vec![];
@@ -276,8 +284,10 @@ async fn status_loop(
                 .iter()
                 .find(|u| u.streamer.profile_name == user.profile_name)
             {
-                debug!("handling update for {}", update.streamer.profile_name);
-                trace!("action: {:?}", update.action);
+                trace!(
+                    "handling action: {:?} for {}",
+                    update.action, update.streamer.profile_name
+                );
                 let mut updated_streamer_status = user.clone();
                 match update.action {
                     downloader::StreamerAction::Stop => {
@@ -302,7 +312,7 @@ async fn status_loop(
             }
         }
 
-        debug!("get users that have been manually requested to stop");
+        trace!("get users that have been manually requested to stop");
         let stopping_users_resp = streamer_api_client
             .get(format!(
                 "http://{}/users/state/stopping",
@@ -365,7 +375,6 @@ async fn status_loop(
             .await;
             continue 'main;
         }
-        debug!("get waiting users ...");
         let waiting_users_resp = streamer_api_client
             .get(format!(
                 "http://{}/users/state/waiting",
@@ -376,6 +385,7 @@ async fn status_loop(
             .unwrap();
         let waiting_users: Vec<Streamer> =
             if let Ok(users) = waiting_users_resp.json::<Vec<Streamer>>().await {
+                debug!("waiting users: {users:?}");
                 users
             } else {
                 debug!("no currently waiting users");
@@ -385,9 +395,16 @@ async fn status_loop(
             debug!("statusing: {}", user.profile_name);
             // TODO: Handle This Error then handle whether or not they're online
             let state: OnlineState =
-                obtain_user_status_retry(&user, &streamer_statuser_client, &room_regex, 4)
+                match obtain_user_status_retry(&user, &streamer_statuser_client, &room_regex, 4)
                     .await
-                    .unwrap();
+                {
+                    Ok(state) => state,
+                    Err(e) => OnlineState::Error(
+                        e.status()
+                            .unwrap_or(reqwest::StatusCode::NOT_FOUND)
+                            .as_u16(),
+                    ),
+                };
             match state {
                 OnlineState::Online(m3u8) => {
                     info!("user {} is online. link: {}", user.profile_name, m3u8);
@@ -416,6 +433,23 @@ async fn status_loop(
                     "user {} is offline, away, or in private.",
                     user.profile_name
                 ),
+                OnlineState::Error(status) => {
+                    let error_user_status = Streamer {
+                        profile_name: user.profile_name.clone(),
+                        profile_url: user.profile_url.clone(),
+                        profile_status: StreamerState::Error(status),
+                        download_size_mb: 0,
+                    };
+                    streamer_api_client
+                        .post(format!(
+                            "http://{}/users/{}",
+                            configuration.backend_url, user.profile_name
+                        ))
+                        .json(&error_user_status)
+                        .send()
+                        .await
+                        .unwrap();
+                }
             }
             sleep(tokio::time::Duration::from_secs(
                 configuration.sleep_time_between_statusing,
@@ -459,7 +493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         ret = status_loop(cfg_clone, status_rx_ptr, status_tx_ptr.clone()) => {
             if let Err(e) = ret {
-                error!("Status Loop Crashed! {}", e);
+                error!("Status Loop Crashed! {e}");
                 status_tx_ptr.send(downloader::StreamerUpdate{
                     streamer: Streamer {
                             profile_url: "N/A".to_string(),
@@ -493,6 +527,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _thread_res = downloader_thread_handle.join();
     Ok(())
 }
+
+#[tokio::test]
+async fn invalid_user_test() {
+    Builder::new()
+        .filter_level(log::LevelFilter::Trace)
+        .target(env_logger::Target::Stdout)
+        .parse_default_env()
+        .init();
+    let user = Streamer {
+        profile_url: String::from("https://google.com/404"),
+        profile_name: String::from("404"),
+        profile_status: StreamerState::Waiting,
+        download_size_mb: 0,
+    };
+    let streamer_statuser_client = Client::new();
+    let room_regex: Regex = Regex::new(r#"window\.initialRoomDossier\s*=\s*("(?:\\.|[^\\"])*")"#)
+        .expect("invalid regex");
+
+    match obtain_user_status_retry(&user, &streamer_statuser_client, &room_regex, 2).await {
+        Ok(state) => panic!("User exists: {:?}", state),
+        Err(e) => {
+            println!("Received Error {:?}", e);
+            assert_eq!(e.status().unwrap().as_u16(), 404);
+        }
+    };
+}
+
 #[cfg(test)]
 #[test]
 fn online_user_test() {
